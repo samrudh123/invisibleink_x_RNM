@@ -369,7 +369,16 @@ def generate(
             counter += 1
             
             # break loop if EOS is encountered
-            if (nxt_token == model.generation_config.eos_token_id).any():
+            eos_ids = model.generation_config.eos_token_id
+            
+            # If the model has a single EOS token (int), convert it to a list
+            if not isinstance(eos_ids, list):
+                eos_ids = [eos_ids]
+                
+            # Safely extract the integer value from the tensor just in case
+            nxt_token_val = nxt_token.item() if hasattr(nxt_token, 'item') else nxt_token
+            
+            if nxt_token_val in eos_ids:
                 break
         
         # store results in a dictionary
