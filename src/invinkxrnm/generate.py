@@ -40,7 +40,8 @@ if FOUND_TORCH and FOUND_TRANSFORMERS:
     from .utils import setup_seed, setup_device
     from .utils import load_hf_model, load_hf_tokenizer
     from .utils import batchify, preprocess, get_prompt
-    from .utils import get_clip, get_epsilon, get_topk, difference_clip
+    from .utils import get_clip, get_clip_rnm, get_epsilon, get_topk, difference_clip
+    from .utils import cdp_rho
     from .utils import rnm_sample
 
 
@@ -62,6 +63,9 @@ def generate(
     delta: Optional[float] = 1e-5, 
     temperature: Optional[float] = 1.0,
     topk: Optional[int] = 100, 
+    rnm_clip: Optional[float] = None,
+    rnm_clip_quantile: float = 0.99,
+    rnm_clip_calibrate: bool = False,
     dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
     device_map: Optional[Union[str, torch.device]] = "auto",
     auth_token: Optional[str] = None,
@@ -101,6 +105,9 @@ def generate(
         topk: int, topk parameter for truncated decoding to zero out the probabilities of all except the top "k" most probable tokens; 
             set to -1 for the full vocabulary setting;
             defaults to 100
+        rnm_clip: fixed clip norm for RNM sensitivity; if provided, overrides calibration and original get_clip
+        rnm_clip_quantile: quantile used when calibrating RNM clip from logit differences
+        rnm_clip_calibrate: whether to calibrate RNM clip from the first batch logits
         device_map: Device mapping strategy; 
             "auto" or custom single-device (GPU ID or -1 for CPU); 
             defaults to "auto"
@@ -175,6 +182,12 @@ def generate(
         raise ValueError("batch_size must be a positive integer.")
     if not (isinstance(topk, int)):
         raise ValueError("top-k parameter must be an integer.")
+    if rnm_clip is not None and not (isinstance(rnm_clip, (int, float)) and rnm_clip >= 0):
+        raise ValueError("rnm_clip must be a non-negative number when provided.")
+    if not (isinstance(rnm_clip_quantile, (int, float)) and 0.0 < float(rnm_clip_quantile) <= 1.0):
+        raise ValueError("rnm_clip_quantile must be in (0, 1].")
+    if not isinstance(rnm_clip_calibrate, bool):
+        raise ValueError("rnm_clip_calibrate must be a boolean.")
     for name, val in (("padding_side", padding_side), ("truncation_side", truncation_side)):
         if not (isinstance(val, str)):
             raise ValueError(f"{name} must be a string.")
@@ -250,22 +263,82 @@ def generate(
         print(f"Set the minibatch size to be equal to batch_size ({batch_size})")
         per_device_minibatch_size = batch_size
     num_minibatches = batch_size // per_device_minibatch_size
+
+    rho_total = cdp_rho(epsilon, delta)
+    rho_tok = rho_total / float(max_toks)
+    epsilon_tok = math.sqrt(2.0 * rho_tok)
     
     # check if there are enough private samples
     if num * (batch_size - 1) > len(texts):
         raise ValueError('Not enough private samples! Use smaller batch sizes or generate fewer synthetic samples.')
 
-    # Calculate clipping threshold
-    clip_norm = get_clip(
-        epsilon = epsilon,
-        num_toks = max_toks,
-        batch_size = batch_size,
-        delta = delta,
-        temp = temperature,
-    )
-    
     # batchify texts
     text_batches = list(batchify(lst = texts, s = batch_size - 1, n = num))
+
+    # Calculate clipping threshold
+    if rnm_clip is not None:
+        clip_norm = get_clip_rnm(fixed_clip = rnm_clip)
+    elif rnm_clip_calibrate:
+        if len(text_batches) == 0:
+            raise ValueError("Cannot calibrate RNM clip without any batches.")
+        calib_batch = text_batches[0]
+        calib_prompts = []
+        for txt in calib_batch:
+            prompt = get_prompt(
+                tokenizer = tokenizer,
+                dataset_desc = dataset_desc,
+                system_prompt = system_prompt,
+                pub_prompt = pub_prompt,
+                prv_prompt = prv_prompt,
+                private_ref = txt,
+            )
+            calib_prompts.append(prompt)
+        prompt = get_prompt(
+            tokenizer = tokenizer,
+            dataset_desc = dataset_desc,
+            system_prompt = system_prompt,
+            pub_prompt = pub_prompt,
+            prv_prompt = prv_prompt,
+        )
+        calib_prompts.append(prompt)
+
+        encoded = tokenizer(calib_prompts, return_tensors='pt', padding=True, truncation=True).to(device)
+        minibatch_masks = list(torch.split(encoded.attention_mask, per_device_minibatch_size))
+        minibatch_tokens = list(torch.split(encoded.input_ids, per_device_minibatch_size))
+        logits = np.zeros((batch_size, vocab_size))
+
+        for j in range(num_minibatches):
+            masks = minibatch_masks[j]
+            prompts = minibatch_tokens[j]
+            low, high = j * per_device_minibatch_size, (j + 1) * per_device_minibatch_size
+            output = model.generate(
+                prompts,
+                past_key_values = None,
+                use_cache = True,
+                max_new_tokens = 1,
+                pad_token_id = tokenizer.eos_token_id,
+                attention_mask = masks,
+                do_sample = True,
+                temperature = temperature,
+                top_p = 1.0,
+                output_logits = True,
+                return_dict_in_generate = True,
+            )
+            logits[low:high, :] = output.logits[0].cpu().numpy()
+
+        del output
+        torch.cuda.empty_cache()
+        pub_logits, prv_logits = logits[-1], logits[:-1]
+        diff_logits = prv_logits - pub_logits
+        clip_norm = get_clip_rnm(diffs = diff_logits, quantile = rnm_clip_quantile)
+    else:
+        clip_norm = get_clip(
+            epsilon = epsilon,
+            num_toks = max_toks,
+            batch_size = batch_size,
+            delta = delta,
+            temp = temperature,
+        )
     
     results = {
         'text': [],
@@ -363,7 +436,7 @@ def generate(
             
             # get next token sampled
             sensitivity = clip_norm / batch_size
-            nxt_token = rnm_sample(avg_clip_logits, epsilon, sensitivity, noise_type='exponential')
+            nxt_token = rnm_sample(avg_clip_logits, epsilon_tok, sensitivity, noise_type='exponential')
             token_seq = torch.cat((token_seq, torch.tensor([nxt_token], device = device)))
             if nxt_token in idxs: ext_count += 1
             counter += 1

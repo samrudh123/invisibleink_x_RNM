@@ -701,6 +701,48 @@ def get_clip(epsilon: float, num_toks: int, temp: float, batch_size: int, delta:
     clip = float(temp) * float(batch_size - 1) * math.sqrt(max(0.0, 2.0 * rho_tok))
     return clip
 
+
+def get_clip_rnm(
+    diffs: Optional[Union[np.ndarray, Sequence[float]]] = None,
+    quantile: float = 0.99,
+    fixed_clip: Optional[float] = None,
+    min_clip: float = 0.0,
+    max_clip: Optional[float] = None,
+) -> float:
+    """Select a clip norm for RNM based on a fixed value or data-driven percentile.
+    Args:
+        diffs: Array-like of logit differences (e.g., prv_logits - pub_logits) used
+            to estimate a clipping threshold. Required if fixed_clip is None.
+        quantile: Quantile in (0, 1] used to set the clip from |diffs|.
+        fixed_clip: If provided, use this value directly.
+        min_clip: Lower bound for the returned clip.
+        max_clip: Optional upper bound for the returned clip.
+    Returns:
+        clip: float, chosen clip norm for RNM sensitivity.
+    """
+    if fixed_clip is not None:
+        clip = float(fixed_clip)
+    else:
+        if diffs is None:
+            raise ValueError("diffs must be provided when fixed_clip is None.")
+        if not (isinstance(quantile, (float, int)) and 0.0 < float(quantile) <= 1.0):
+            raise ValueError("quantile must be in (0, 1].")
+        diffs_arr = np.asarray(diffs, dtype=float)
+        if diffs_arr.size == 0:
+            raise ValueError("diffs must be non-empty when fixed_clip is None.")
+        clip = float(np.quantile(np.abs(diffs_arr), float(quantile)))
+
+    if not (isinstance(clip, (float, int)) and clip >= 0.0):
+        raise ValueError("clip must be a non-negative number.")
+    if not (isinstance(min_clip, (float, int)) and float(min_clip) >= 0.0):
+        raise ValueError("min_clip must be a non-negative number.")
+    clip = max(float(min_clip), float(clip))
+    if max_clip is not None:
+        if not (isinstance(max_clip, (float, int)) and float(max_clip) >= 0.0):
+            raise ValueError("max_clip must be a non-negative number.")
+        clip = min(float(max_clip), float(clip))
+    return clip
+
 def rnm_sample(logits: torch.Tensor, epsilon: float, sensitivity: float, noise_type='exponential') -> int:
     """Sample from the Report Noisy Max (RNM) mechanism for a given set of logits.
     Args:
