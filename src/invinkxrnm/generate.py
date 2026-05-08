@@ -366,7 +366,7 @@ def generate(
             topk_counts.append(np.sum((pub_mask)))
             
             # get next token sampled
-            nxt_token = rnm_sample(avg_clip_logits, lambd)
+            nxt_token = rnm_exponential_sample(avg_clip_logits, lambd)
             token_seq = torch.cat((token_seq, torch.tensor([nxt_token], device = device)))
             if nxt_token in idxs: ext_count += 1
             counter += 1
