@@ -644,7 +644,7 @@ def compute_rho(num_toks: int, clip_norm: float, batch_size: int, temp: float) -
         if not (isinstance(val, (float, int)) and val > 0):
             raise ValueError(f"{name} must be a positive number.")
 
-    rho_tok = 0.5 * (float(clip_norm) / (float(batch_size) * float(temp))) ** 2
+    rho_tok = 2 * (float(clip_norm) / (float(batch_size) * float(temp))) ** 2
     rho_tot = float(num_toks) * rho_tok
     return rho_tot
 
@@ -675,12 +675,12 @@ def get_epsilon(num_toks: int, clip_norm: float, batch_size: int, temp: float, d
     return eps
 
 
-def get_clip(epsilon: float, num_toks: int, temp: float, batch_size: int, delta: float = 1e-6) -> float:
+def get_clip(epsilon: float, num_toks: int, lambd: float, batch_size: int, delta: float = 1e-6) -> float:
     """Compute required clipping norm for target eps (inverse of get_epsilon).
     Args:
         eps: non-negative float, target epsilon (privacy budget) for (eps, delta)-DP (ADP).
         num_toks: positive int, number of tokens generated.
-        temp: positive float, sampling temperature used during generation.
+        lambda: positive float, scaling parameter for the exponential distribution (noise scale).
         batch_size: positive int (>1), number of LLM inferences per generation (B+1 in the paper).
         delta: float in (0, 1), delta (failure probability) for ADP.
     Returns:
@@ -692,93 +692,38 @@ def get_clip(epsilon: float, num_toks: int, temp: float, batch_size: int, delta:
         raise ValueError("num_toks must be a positive integer.")
     if not (isinstance(delta, (float, int)) and 0.0 < float(delta) < 1.0):
         raise ValueError("delta must be in (0,1).")
-    for name, val in (("epsilon", epsilon), ("temp", temp)):
+    for name, val in (("epsilon", epsilon), ("lambd", lambd)):
         if not (isinstance(val, (float, int)) and val >= 0):
             raise ValueError(f"{name} must be a non-negative number.")
         
     rho_tot = cdp_rho(epsilon, delta)
     rho_tok = rho_tot / float(num_toks)
-    clip = float(temp) * float(batch_size - 1) * math.sqrt(max(0.0, 2.0 * rho_tok))
+    clip = 0.5 * float(lambd) * float(batch_size - 1) * math.sqrt(max(0.0, 2.0 * rho_tok))
     return clip
 
-
-def get_clip_rnm(
-    diffs: Optional[Union[np.ndarray, Sequence[float]]] = None,
-    quantile: float = 0.99,
-    fixed_clip: Optional[float] = None,
-    min_clip: float = 0.0,
-    max_clip: Optional[float] = None,
-) -> float:
-    """Select a clip norm for RNM based on a fixed value or data-driven percentile.
-    Args:
-        diffs: Array-like of logit differences (e.g., prv_logits - pub_logits) used
-            to estimate a clipping threshold. Required if fixed_clip is None.
-        quantile: Quantile in (0, 1] used to set the clip from |diffs|.
-        fixed_clip: If provided, use this value directly.
-        min_clip: Lower bound for the returned clip.
-        max_clip: Optional upper bound for the returned clip.
-    Returns:
-        clip: float, chosen clip norm for RNM sensitivity.
-    """
-    if fixed_clip is not None:
-        clip = float(fixed_clip)
-    else:
-        if diffs is None:
-            raise ValueError("diffs must be provided when fixed_clip is None.")
-        if not (isinstance(quantile, (float, int)) and 0.0 < float(quantile) <= 1.0):
-            raise ValueError("quantile must be in (0, 1].")
-        diffs_arr = np.asarray(diffs, dtype=float)
-        if diffs_arr.size == 0:
-            raise ValueError("diffs must be non-empty when fixed_clip is None.")
-        clip = float(np.quantile(np.abs(diffs_arr), float(quantile)))
-
-    if not (isinstance(clip, (float, int)) and clip >= 0.0):
-        raise ValueError("clip must be a non-negative number.")
-    if not (isinstance(min_clip, (float, int)) and float(min_clip) >= 0.0):
-        raise ValueError("min_clip must be a non-negative number.")
-    clip = max(float(min_clip), float(clip))
-    if max_clip is not None:
-        if not (isinstance(max_clip, (float, int)) and float(max_clip) >= 0.0):
-            raise ValueError("max_clip must be a non-negative number.")
-        clip = min(float(max_clip), float(clip))
-    return clip
-
-def rnm_sample(logits: torch.Tensor, epsilon: float, sensitivity: float, noise_type='exponential') -> int:
+def rnm_exponential_sample(logits: torch.Tensor, lambd: float) -> int:
     """Sample from the Report Noisy Max (RNM) mechanism for a given set of logits.
     Args:
         logits: 1-D array-like of input logits (utility scores).
-        epsilon: non-negative float, privacy budget for RNM.
-        sensitivity: positive float, sensitivity of the utility function (max change in logits due to one individual's data).
-        noise_type: type of noise to add ("exponential" or "laplace").
+        lambd: positive float, scaling parameter for the exponential distribution (noise scale).
     Returns:
         index: int, index of the selected element after applying RNM.
     """
-    if not (isinstance(epsilon, (float, int)) and epsilon >= 0):
-        raise ValueError("epsilon must be a non-negative number.")
-    if not (isinstance(sensitivity, (float, int)) and sensitivity > 0):
-        raise ValueError("sensitivity must be a positive number.")
-    if noise_type not in ('exponential', 'laplace'):
-        raise ValueError("noise_type must be 'exponential' or 'laplace'.")
-    
+    if not (isinstance(lambd, (float, int)) and lambd > 0):
+        raise ValueError("lambd must be a positive number.")
+
     # Ensure logits is a torch tensor to avoid Numpy attribute errors
     if not isinstance(logits, torch.Tensor):
         logits = torch.tensor(logits)
-
-    if noise_type == 'exponential':
-        scale = (2.0 * sensitivity) / epsilon
-        
-        # Use a scalar tensor and place it on the same device as logits
-        rate = torch.tensor(1.0 / scale, device=logits.device)
-        
-        # Use logits.shape instead of logits.size
-        m = Exponential(rate).sample(logits.shape)
     
-        # Report Noisy Max: Add noise to logits and take argmax
-        noisy_logits = logits + m
+    # Use a scalar tensor and place it on the same device as logits
+    rate = torch.tensor(1.0 / lambd, device=logits.device)
+    
+    # Use logits.shape instead of logits.size
+    m = Exponential(rate).sample(logits.shape)
 
-    # (Optional) Handle laplace noise here if you plan to use it later
-    elif noise_type == 'laplace':
-        raise NotImplementedError("Laplace noise is not yet implemented.")
+    # Report Noisy Max: Add noise to logits and take argmax
+    noisy_logits = logits + m
 
     selected_index = torch.argmax(noisy_logits, dim=-1)
     return selected_index
